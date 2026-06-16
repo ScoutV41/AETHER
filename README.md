@@ -70,7 +70,7 @@ JSON
     }
 }
 
- ##License
+ ## License
  This project is licensed under the Apache License 2.0.What this means for you:
 
 - You Can: Use, modify, distribute, and sell this software for personal or commercial projects completely free of charge.
