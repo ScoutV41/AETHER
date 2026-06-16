@@ -2,7 +2,6 @@
 ========================================================
   AETHER - AI & Hardware Benchmark Runner
   Open Source Local AI Compute Benchmark
-  github.com/Scout316/aether-bench  <-- update this
 ========================================================
 
 What this script collects and why:
