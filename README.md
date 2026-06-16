@@ -1,5 +1,5 @@
 
-### ROCm Crowdsourced Benchmark Runner
+### AETHER ROCm Crowdsourced Benchmark Runner
 A standardized, community-driven hardware profiling and LLM inference benchmark tool. This project gathers real-world telemetry from volunteers to build an open, comparative index of local AI performance, with special attention given to native AMD ROCm optimization.
 
 By crowdsourcing performance data across varied systems, this tool eliminates guesswork and creates an authentic baseline for consumer and enterprise hardware alike.
