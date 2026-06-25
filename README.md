@@ -60,8 +60,8 @@ pip install psutil GPUtil requests
 
 **1. Clone the repo**
 ```bash
-git clone https://github.com/Scout316/aether-bench
-cd aether-bench
+git clone https://github.com/ScoutV41/AETHER
+cd AETHER
 ```
 
 **2. Install dependencies**
