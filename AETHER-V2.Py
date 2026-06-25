@@ -13,6 +13,12 @@ What this script collects and why:
 
 Nothing is uploaded automatically. Results are saved locally to
 benchmark_result.json. Share them however you'd like.
+
+Usage:
+  python AETHER-V2.py                          Interactive CUI menu
+  python AETHER-V2.py --headless               Run once, no menu, using defaults/auto-detect
+  python AETHER-V2.py --model llama3:8b        Headless, specific model
+  python AETHER-V2.py --backend ollama --model llama3:8b --runs 5 --quiet
 """
 
 import time
@@ -22,22 +28,10 @@ import json
 import os
 import sys
 import re
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 import argparse
-
-def parse_args():
-    p = argparse.ArgumentParser(description="AETHER - AI & Hardware Benchmark Runner")
-    p.add_argument("--runs", type=int, default=NUM_RUNS, help="Number of benchmark runs")
-    p.add_argument("--model", type=str, default=None, help="Model name (skips interactive selection)")
-    p.add_argument("--backend", type=str, choices=["ollama", "lmstudio"], default=None)
-    p.add_argument("--ctx", type=int, default=CONTEXT_WINDOW, help="Context window size")
-    p.add_argument("--no-warmup", action="store_true", help="Skip warm-up run")
-    p.add_argument("--output", type=str, default=OUTPUT_FILE, help="Output JSON path")
-    p.add_argument("--timeout", type=int, default=INFERENCE_TIMEOUT_SEC,
-                    help="Seconds to wait for a benchmark response before timing out (default: 100)")
-    return p.parse_args()
-
 
 # == Optional dependencies ======================================================
 try:
@@ -47,7 +41,7 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import GPUtil # type: ignore
+    import GPUtil  # type: ignore
     GPUTIL_AVAILABLE = True
 except ImportError:
     GPUTIL_AVAILABLE = False
@@ -60,16 +54,17 @@ except ImportError:
 
 # == Constants & Colors =========================================================
 OLLAMA_BASE     = "http://localhost:11434"
-LMS_BASE        = "http://localhost:1234"   
+LMS_BASE        = "http://localhost:1234"
 BENCHMARK_PROMPT = (
     "Write a detailed 300-word essay explaining quantum computing to a five-year-old. "
     "Use simple analogies and avoid technical jargon."
 )
-CONTEXT_WINDOW  = 2048
-INFERENCE_TIMEOUT_SEC = 100 
-NUM_RUNS    = 3 
-WARMUP_RUN  = True 
-OUTPUT_FILE     = "benchmark_result.json"
+CONTEXT_WINDOW        = 2048
+INFERENCE_TIMEOUT_SEC = 100
+NUM_RUNS              = 3
+WARMUP_RUN            = True
+OUTPUT_FILE           = "benchmark_result.json"
+AETHER_VERSION        = "0.3.0"
 
 # ANSI Colors
 C_CYAN    = "\033[96m"
@@ -87,8 +82,28 @@ BANNER = f"""{C_CYAN}{C_BOLD}
 ╚══════════════════════════════════════════════════════╝{C_RESET}
 """
 
+
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="AETHER - AI & Hardware Benchmark Runner")
+    p.add_argument("--headless", action="store_true",
+                    help="Run once without the interactive menu, then exit")
+    p.add_argument("--runs", type=int, default=NUM_RUNS, help="Number of benchmark runs")
+    p.add_argument("--model", type=str, default=None, help="Model name (skips interactive selection)")
+    p.add_argument("--backend", type=str, choices=["ollama", "lmstudio"], default=None,
+                    help="Force a specific backend instead of auto-detecting")
+    p.add_argument("--ctx", type=int, default=CONTEXT_WINDOW, help="Context window size")
+    p.add_argument("--no-warmup", action="store_true", help="Skip warm-up run")
+    p.add_argument("--cpu-only", action="store_true", help="Force CPU-only hardware profiling (skip GPU detection)")
+    p.add_argument("--output", type=str, default=OUTPUT_FILE, help="Output JSON path")
+    p.add_argument("--timeout", type=int, default=INFERENCE_TIMEOUT_SEC,
+                    help="Seconds to wait for a benchmark response before timing out (default: 100)")
+    p.add_argument("--quiet", action="store_true",
+                    help="Headless mode only: suppress the full JSON dump to stdout")
+    return p.parse_args()
 
 
 # ==============================================================================
@@ -208,9 +223,11 @@ def _detect_nvidia() -> dict | None:
 
 
 def _detect_amd_windows() -> dict:
+    """AMD GPU detection on Windows using dxdiag XML with wmic fallback."""
     result = {"gpu_model": "Unknown", "gpu_vram_gb": 0.0, "gpu_driver": "Unknown"}
 
-    dxdiag_xml = "dxdiag_temp.xml"
+    # Unique temp filename avoids collisions if AETHER is ever run twice in parallel
+    dxdiag_xml = os.path.join(tempfile.gettempdir(), f"aether_dxdiag_{os.getpid()}.xml")
     try:
         subprocess.run(
             f"dxdiag /x {dxdiag_xml}",
@@ -227,8 +244,8 @@ def _detect_amd_windows() -> dict:
                 card_name = device.find("CardName")
                 chip      = device.find("ChipType")
                 dname     = device.find("DeviceName")
-                dmem_ded  = device.find("DedicatedMemory") 
-                dmem_all  = device.find("DisplayMemory")   
+                dmem_ded  = device.find("DedicatedMemory")
+                dmem_all  = device.find("DisplayMemory")
                 dver      = device.find("DriverVersion")
                 dev_type  = device.find("DeviceType")
 
@@ -335,20 +352,20 @@ def _detect_amd_linux() -> dict:
 
 def get_system_specs(cpu_only_override=False) -> dict:
     specs = {
-        "os":                platform.system(),
-        "os_release":        platform.release(),
-        "os_version":        platform.version(),
-        "python_version":    platform.python_version(),
-        "cpu_model":         _get_cpu_name(),
+        "os":                 platform.system(),
+        "os_release":         platform.release(),
+        "os_version":         platform.version(),
+        "python_version":     platform.python_version(),
+        "cpu_model":          _get_cpu_name(),
         "cpu_cores_physical": psutil.cpu_count(logical=False),
         "cpu_cores_logical":  psutil.cpu_count(logical=True),
-        "ram_gb":            round(psutil.virtual_memory().total / (1024 ** 3), 2),
-        "gpu_model":         "Unknown/CPU-Only",
-        "gpu_vram_gb":       0.0,
-        "gpu_driver":        "Unknown",
-        "gpu_vendor":        "Unknown",
-        "cuda_version":      "N/A",
-        "rocm_version":      "N/A",
+        "ram_gb":             round(psutil.virtual_memory().total / (1024 ** 3), 2),
+        "gpu_model":          "Unknown/CPU-Only",
+        "gpu_vram_gb":        0.0,
+        "gpu_driver":         "Unknown",
+        "gpu_vendor":         "Unknown",
+        "cuda_version":       "N/A",
+        "rocm_version":       "N/A",
     }
 
     if cpu_only_override:
@@ -410,7 +427,7 @@ def list_models(backend: str, base_url: str) -> list[str]:
     return []
 
 
-def get_model_info(backend: str, base_url: str, model_name: str) -> dict:
+def get_model_info(backend: str, base_url: str, model_name: str, interactive: bool = True) -> dict:
     if backend == "ollama":
         try:
             r = requests.post(
@@ -433,8 +450,8 @@ def get_model_info(backend: str, base_url: str, model_name: str) -> dict:
             if tag.lower() in model_name.lower():
                 quant = tag
                 break
-        if quant == "Unknown":
-            print(f"\n  [?] Could not detect quantization from model ID: '{model_name}'")
+        if quant == "Unknown" and interactive:
+            print(f"\n  {C_YELLOW}[?] Could not detect quantization from model ID: '{model_name}'{C_RESET}")
             user_quant = input("      Enter quantization level (or press Enter to skip): ").strip()
             if user_quant:
                 quant = user_quant
@@ -478,7 +495,7 @@ def run_ollama_benchmark(base_url: str, model_name: str) -> dict:
             "context_window": CONTEXT_WINDOW,
         }
     except requests.exceptions.Timeout:
-        return {"status": "Failed", "error": "Request timed out"}
+        return {"status": "Failed", "error": "Request timed out (model may be too slow or stuck loading)"}
     except requests.exceptions.ConnectionError:
         return {"status": "Failed", "error": "Could not connect to Ollama"}
     except Exception as e:
@@ -494,7 +511,7 @@ def run_lmstudio_benchmark(base_url: str, model_name: str) -> dict:
     }
     start = time.time()
     try:
-        r = requests.post(f"{base_url}/v1/chat/completions", json=payload, timeout=INFERENCE_TIMEOUT_SEC)        
+        r = requests.post(f"{base_url}/v1/chat/completions", json=payload, timeout=INFERENCE_TIMEOUT_SEC)
         elapsed = time.time() - start
 
         if r.status_code != 200:
@@ -515,10 +532,10 @@ def run_lmstudio_benchmark(base_url: str, model_name: str) -> dict:
             "prompt_tokens_per_sec":     "N/A (LM Studio)",
             "generation_tokens_per_sec": gen_tps,
             "context_window":            CONTEXT_WINDOW,
-            "note": "LM Studio wall-time derived t/s"
+            "note": "LM Studio wall-time derived t/s -- includes prompt processing overhead"
         }
     except requests.exceptions.Timeout:
-        return {"status": "Failed", "error": "Request timed out"}
+        return {"status": "Failed", "error": "Request timed out (model may be too slow or stuck loading)"}
     except requests.exceptions.ConnectionError:
         return {"status": "Failed", "error": "Could not connect to LM Studio"}
     except Exception as e:
@@ -526,10 +543,11 @@ def run_lmstudio_benchmark(base_url: str, model_name: str) -> dict:
 
 
 def run_benchmark(backend: str, base_url: str, model_name: str) -> dict:
-    runner = run_ollama_benchmark if backend == "ollama" else run_lmstudio_benchmark # type: ignore
-    if backend not in ("ollama", "lmstudio"): # type: ignore
-        return {"status": "Failed", "error": 'Unknown backend'}
-    
+    if backend not in ("ollama", "lmstudio"):
+        return {"status": "Failed", "error": "Unknown backend"}
+
+    runner = run_ollama_benchmark if backend == "ollama" else run_lmstudio_benchmark
+
     all_runs = []
     total_runs = NUM_RUNS + (1 if WARMUP_RUN else 0)
 
@@ -538,7 +556,7 @@ def run_benchmark(backend: str, base_url: str, model_name: str) -> dict:
         print(f"    {C_CYAN}[{label}]{C_RESET} Running inference...")
         result = runner(base_url, model_name)
         if WARMUP_RUN and i == 0:
-            continue 
+            continue
         if result["status"] == "Success":
             all_runs.append(result)
         else:
@@ -546,34 +564,36 @@ def run_benchmark(backend: str, base_url: str, model_name: str) -> dict:
 
     if not all_runs:
         return {"status": "Failed", "error": "All runs failed"}
-    
-    gen_speeds = [r["generation_tokens_per_sec"] for r in all_runs] # type: ignore
-    wall_times = [r["wall_time_sec"] for r in all_runs] # type: ignore
+
+    gen_speeds = [r["generation_tokens_per_sec"] for r in all_runs]
+    wall_times = [r["wall_time_sec"] for r in all_runs]
 
     return {
-        "status":                           "Success",
-        "runs_completed":                   len(all_runs),
-        "generation_tokens_per_sec":        round(sorted(gen_speeds)[len(gen_speeds)//2], 2),
-        "generation_tokens_per_sec_avg":    round(sum(gen_speeds), 2),
-        "generation_tokens_per_sec_min":    round(min(gen_speeds), 2),
-        "generation_tokens_per_sec_max":    round(max(gen_speeds), 2),
-        "prompt_tokens_per_sec":            all_runs[0].get("prompt_tokens_per_sec", "N/A"),
-        "wall_time_sec":                    round(sum(wall_times)/len(wall_times), 2),
-        "prompt_tokens":                    all_runs[0]["prompt_tokens"],
-        "generation_tokens":                all_runs[0]["generation_tokens"],
-        'context_window':                   CONTEXT_WINDOW,
-        "all_runs":                         all_runs,
+        "status":                        "Success",
+        "runs_completed":                len(all_runs),
+        # Median is the headline number -- more resistant to one-off thermal/background-load outliers
+        "generation_tokens_per_sec":     round(sorted(gen_speeds)[len(gen_speeds) // 2], 2),
+        "generation_tokens_per_sec_avg": round(sum(gen_speeds) / len(gen_speeds), 2),
+        "generation_tokens_per_sec_min": round(min(gen_speeds), 2),
+        "generation_tokens_per_sec_max": round(max(gen_speeds), 2),
+        "prompt_tokens_per_sec":         all_runs[0].get("prompt_tokens_per_sec", "N/A"),
+        "wall_time_sec_avg":             round(sum(wall_times) / len(wall_times), 2),
+        "prompt_tokens":                 all_runs[0]["prompt_tokens"],
+        "generation_tokens":             all_runs[0]["generation_tokens"],
+        "context_window":                CONTEXT_WINDOW,
+        "all_runs":                      all_runs,
     }
+
 
 def compute_aether_score(hw: dict, results: dict) -> dict:
     if results["status"] != "Success":
         return {"score": 0, "tier": "N/A"}
-    
+
     gen_tps = results["generation_tokens_per_sec"]
-    vram = hw.get("gpu_vram_gb", 0) or 1 
+    vram = hw.get("gpu_vram_gb", 0) or 1
 
     raw_score = gen_tps * 10
-    efficiency = gen_tps / vram if vram else 0 
+    efficiency = gen_tps / vram if vram else 0
     efficiency_bonus = efficiency * 5
 
     total = round(raw_score + efficiency_bonus, 1)
@@ -590,18 +610,132 @@ def compute_aether_score(hw: dict, results: dict) -> dict:
         tier = "D - Limited"
 
     return {
-        "score":                    total,
-        "tier":                     tier,
-        "raw_speed_component":      round(raw_score, 1),
-        "efficiency_component":     round(efficiency_bonus, 1),
+        "score":                total,
+        "tier":                 tier,
+        "raw_speed_component":  round(raw_score, 1),
+        "efficiency_component": round(efficiency_bonus, 1),
     }
+
+
+def build_payload(backend, chosen_model, model_info, hw, results, aether_score) -> dict:
+    """Shared by both CUI and headless paths so the saved JSON is always identical in shape."""
+    return {
+        "aether_version":   AETHER_VERSION,
+        "run_id":           f"{platform.node()}-{int(time.time())}",
+        "timestamp_utc":    datetime.now(timezone.utc).isoformat(),
+        "backend":          backend,
+        "model":            chosen_model,
+        "model_info":       model_info,
+        "hardware":         hw,
+        "benchmark":        results,
+        "aether_score":     aether_score,
+        "timeout_sec_used": INFERENCE_TIMEOUT_SEC,
+    }
+
+
+# ==============================================================================
+# HEADLESS MODE
+# ==============================================================================
+
+def run_headless(args) -> int:
+    """
+    Runs one full benchmark pass with no menu and no blocking prompts.
+    Returns a process exit code (0 success, 1 failure) so it's script/CI friendly.
+    """
+    print(BANNER)
+    print(f"{C_CYAN}[Headless Mode]{C_RESET} Running non-interactively\n")
+
+    # --- Backend ---
+    if args.backend:
+        backend = args.backend
+        base_url = OLLAMA_BASE if backend == "ollama" else LMS_BASE
+        check_url = f"{base_url}/api/tags" if backend == "ollama" else f"{base_url}/v1/models"
+        try:
+            r = requests.get(check_url, timeout=3)
+            if r.status_code != 200:
+                print(f"{C_RED}[!] {backend} did not respond at {base_url} (HTTP {r.status_code}){C_RESET}")
+                return 1
+        except Exception:
+            print(f"{C_RED}[!] Could not reach {backend} at {base_url}. Is it running?{C_RESET}")
+            return 1
+    else:
+        backend, base_url = detect_backend()
+        if not backend:
+            print(f"{C_RED}[!] No backend detected. Start Ollama or LM Studio, or pass --backend explicitly.{C_RESET}")
+            return 1
+
+    print(f"{C_GREEN}[+] Backend: {backend.upper()} at {base_url}{C_RESET}")
+
+    # --- Model ---
+    models = list_models(backend, base_url)
+    if not models:
+        print(f"{C_RED}[!] No models found on {backend}. Load a model first.{C_RESET}")
+        return 1
+
+    if args.model:
+        if args.model not in models:
+            print(f"{C_RED}[!] Model '{args.model}' not found on {backend}.{C_RESET}")
+            print(f"    Available: {', '.join(models)}")
+            return 1
+        chosen_model = args.model
+    elif len(models) == 1:
+        chosen_model = models[0]
+        print(f"{C_CYAN}[i] Auto-selected only available model: {chosen_model}{C_RESET}")
+    else:
+        print(f"{C_RED}[!] Multiple models available -- pass --model to pick one in headless mode:{C_RESET}")
+        for m in models:
+            print(f"    - {m}")
+        return 1
+
+    print(f"{C_GREEN}[+] Model: {chosen_model}{C_RESET}")
+
+    # --- Hardware ---
+    print(f"{C_CYAN}[+] Profiling hardware...{C_RESET}")
+    hw = get_system_specs(cpu_only_override=args.cpu_only)
+    gpu_str = f"{hw['gpu_model']} ({hw['gpu_vram_gb']}GB)" if hw['gpu_model'] != "Unknown/CPU-Only" else "None / CPU-only"
+    print(f"    CPU: {hw['cpu_model']}")
+    print(f"    GPU: {gpu_str}")
+
+    # --- Benchmark ---
+    print(f"\n{C_CYAN}[+] Running benchmark -- {NUM_RUNS} run(s), warmup={'on' if WARMUP_RUN else 'off'}, "
+          f"ctx={CONTEXT_WINDOW}, timeout={INFERENCE_TIMEOUT_SEC}s{C_RESET}\n")
+
+    results = run_benchmark(backend, base_url, chosen_model)
+
+    if results["status"] != "Success":
+        print(f"\n{C_RED}[!] Benchmark failed: {results['error']}{C_RESET}")
+        return 1
+
+    # interactive=False so a missing LM Studio quant tag never blocks on input() in headless mode
+    model_info = get_model_info(backend, base_url, chosen_model, interactive=False)
+    aether_score = compute_aether_score(hw, results)
+
+    print(f"\n  {C_BOLD}Generation speed (median):{C_RESET} {results['generation_tokens_per_sec']} tok/s")
+    print(f"  {C_BOLD}Avg / Min / Max:{C_RESET}           "
+          f"{results['generation_tokens_per_sec_avg']} / "
+          f"{results['generation_tokens_per_sec_min']} / "
+          f"{results['generation_tokens_per_sec_max']} tok/s")
+    print(f"  {C_BOLD}Wall time (avg):{C_RESET}           {results['wall_time_sec_avg']}s")
+    print(f"\n  {C_GREEN}{C_BOLD}AETHER Score: {aether_score['score']} ({aether_score['tier']}){C_RESET}")
+
+    payload = build_payload(backend, chosen_model, model_info, hw, results, aether_score)
+
+    with open(args.output, "w") as f:
+        json.dump(payload, f, indent=4)
+
+    print(f"\n{C_CYAN}[+] Results saved to {args.output}{C_RESET}")
+
+    if not args.quiet:
+        print(json.dumps(payload, indent=4))
+
+    return 0
+
 
 # ==============================================================================
 # CUI MAIN MENU
 # ==============================================================================
 
 def main_menu():
-    # Lazy loading hardware info placeholders so terminal boots up instantaneously
     hw = None
     backend, base_url = detect_backend()
     chosen_model = None
@@ -610,10 +744,9 @@ def main_menu():
     while True:
         clear_screen()
         print(BANNER)
-        
-        # Display Current Status
+
         print(f"{C_YELLOW}--- Current Configuration ---{C_RESET}")
-        
+
         if hw is None:
             print(f"  {C_BOLD}Hardware:{C_RESET} [Not scanned yet - Select option 3 or run benchmark]")
         else:
@@ -622,15 +755,14 @@ def main_menu():
             else:
                 gpu_str = f"{hw['gpu_model']} ({hw['gpu_vram_gb']}GB)" if hw['gpu_model'] != "Unknown/CPU-Only" else "None Detected"
                 print(f"  {C_BOLD}Hardware:{C_RESET} {hw['cpu_model']} | GPU: {gpu_str}")
-            
+
         b_str = backend.upper() if backend else f"{C_RED}Not Detected{C_RESET}"
         print(f"  {C_BOLD}Backend:{C_RESET}  {b_str} {f'({base_url})' if base_url else ''}")
-        
+
         m_str = chosen_model if chosen_model else f"{C_RED}None Selected{C_RESET}"
         print(f"  {C_BOLD}Model:{C_RESET}    {m_str}")
         print(f"{C_YELLOW}-----------------------------{C_RESET}\n")
 
-        # Menu Options
         print(f"{C_CYAN}1.{C_RESET} Run Benchmark")
         print(f"{C_CYAN}2.{C_RESET} Toggle CPU-Only Mode")
         print(f"{C_CYAN}3.{C_RESET} Scan / Re-Scan Hardware (May take a moment)")
@@ -647,8 +779,7 @@ def main_menu():
             if not chosen_model:
                 input(f"\n{C_RED}[!] No model selected. Press Enter to return to menu...{C_RESET}")
                 continue
-            
-            # Defer full scan until execution if user skipped option 3
+
             if hw is None:
                 print(f"\n{C_CYAN}[i] Gathering system specs for the benchmark payload...{C_RESET}")
                 hw = get_system_specs(cpu_only_override=cpu_only_mode)
@@ -656,45 +787,36 @@ def main_menu():
             print(f"\n{C_GREEN}[+] Starting Benchmark on {chosen_model}...{C_RESET}")
             print(f"    Context window: {CONTEXT_WINDOW} tokens")
             print("    This may take a few minutes...\n")
-            
+
             results = run_benchmark(backend, base_url, chosen_model)
 
             if results["status"] == "Success":
-                print(f"\n  {C_BOLD}Generation speed:{C_RESET}  {results['generation_tokens_per_sec']} tok/s")
-                print(f"  {C_BOLD}Prompt eval speed:{C_RESET} {results['prompt_tokens_per_sec']} tok/s")
-                print(f"  {C_BOLD}Wall time:{C_RESET}         {results['wall_time_sec']}s")
-                print(f"  {C_BOLD}Tokens generated:{C_RESET}  {results['generation_tokens']}")
-                
+                print(f"\n  {C_BOLD}Generation speed (median):{C_RESET} {results['generation_tokens_per_sec']} tok/s")
+                print(f"  {C_BOLD}Avg / Min / Max:{C_RESET}           "
+                      f"{results['generation_tokens_per_sec_avg']} / "
+                      f"{results['generation_tokens_per_sec_min']} / "
+                      f"{results['generation_tokens_per_sec_max']} tok/s")
+                print(f"  {C_BOLD}Prompt eval speed:{C_RESET}         {results['prompt_tokens_per_sec']} tok/s")
+                print(f"  {C_BOLD}Wall time (avg):{C_RESET}           {results['wall_time_sec_avg']}s")
+                print(f"  {C_BOLD}Tokens generated:{C_RESET}          {results['generation_tokens']}")
+
                 model_info = get_model_info(backend, base_url, chosen_model)
                 aether_score = compute_aether_score(hw, results)
-                
+
                 print(f"\n  {C_GREEN}{C_BOLD}AETHER Score: {aether_score['score']} ({aether_score['tier']}){C_RESET}")
 
-                # Save Routine
-                payload = {
-                    "aether_version":  "0.2.1",
-                    "run_id":           f"{platform.node()}-{int(time.time())}",
-                    "timestamp_utc":   datetime.now(timezone.utc).isoformat(),
-                    "backend":         backend,
-                    "model":           chosen_model,
-                    "model_info":      model_info,
-                    "hardware":        hw,
-                    "benchmark":       results,
-                    "aether_score":    aether_score,
-                    "timeout_sec_used": INFERENCE_TIMEOUT_SEC,
-                }
+                payload = build_payload(backend, chosen_model, model_info, hw, results, aether_score)
                 with open(OUTPUT_FILE, "w") as f:
                     json.dump(payload, f, indent=4)
                 print(f"\n  {C_CYAN}[+] Results saved to {OUTPUT_FILE}{C_RESET}")
 
-                # RE-INSERTED COMMUNITY AND DISCORD FOOTER BLOCKS
                 print("\n  ─────────────────────────────────────────────────────")
                 print("  Share your results to contribute to the database!")
                 print("  Discord: [https://discord.gg/uZ2M8D9cWY]")
                 print("  ─────────────────────────────────────────────────────\n")
             else:
                 print(f"\n  {C_RED}[!] Benchmark failed: {results['error']}{C_RESET}")
-            
+
             input("\nPress Enter to return to menu...")
 
         elif choice == '2':
@@ -710,7 +832,7 @@ def main_menu():
 
         elif choice == '4':
             backend, base_url = detect_backend()
-            chosen_model = None 
+            chosen_model = None
             if backend:
                 input(f"\n{C_GREEN}[+] Detected {backend.upper()}{C_RESET}. Press Enter to continue...")
             else:
@@ -720,17 +842,17 @@ def main_menu():
             if not backend or not base_url:
                 input(f"\n{C_RED}[!] Detect a backend first.{C_RESET} Press Enter...")
                 continue
-            
+
             models = list_models(backend, base_url)
             if not models:
                 input(f"\n{C_RED}[!] No models found in backend.{C_RESET} Press Enter...")
                 continue
-            
+
             clear_screen()
             print(f"{C_CYAN}--- Available Models ---{C_RESET}")
             for i, m in enumerate(models):
                 print(f"  {C_YELLOW}[{i}]{C_RESET} {m}")
-            
+
             try:
                 idx = int(input(f"\nSelect model {C_CYAN}[0-{len(models)-1}]{C_RESET}: "))
                 if 0 <= idx < len(models):
@@ -742,8 +864,10 @@ def main_menu():
             clear_screen()
             sys.exit(0)
 
+
 def main():
     args = parse_args()
+
     global NUM_RUNS, CONTEXT_WINDOW, OUTPUT_FILE, WARMUP_RUN, INFERENCE_TIMEOUT_SEC
     NUM_RUNS = args.runs
     CONTEXT_WINDOW = args.ctx
@@ -751,16 +875,19 @@ def main():
     WARMUP_RUN = not args.no_warmup
     INFERENCE_TIMEOUT_SEC = args.timeout
 
-    if args.model or args.backend:
-        print("[!] Running in headless CLI mode due to provided arguments...")
-        print("Headless mode logic goes here (omitted for CUI focus).")
-        sys.exit(0)
+    # Any of these implies headless intent -- no menu, no input() prompts, exit code reflects success/failure
+    headless_triggered = args.headless or args.model or args.backend
+
+    if headless_triggered:
+        exit_code = run_headless(args)
+        sys.exit(exit_code)
 
     try:
         main_menu()
     except KeyboardInterrupt:
         print(f"\n{C_RED}Exiting AETHER...{C_RESET}")
         sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
