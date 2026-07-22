@@ -93,7 +93,7 @@ python benchmark.py
 
 Results are saved to `benchmark_result.json` in the same folder you ran the script from.
 
-Share them in the [Discord server](https://discord.gg/yhQeCRyc) in the `#benchmark-results` channel. So I can crowdsource results for comparison charts.
+Share them in the [Discord server](https://discord.gg/43prq9ht) in the `#benchmark-results` channel. So I can crowdsource results for comparison charts.
 
 Paste the full JSON or attach the file. Include:
 - Your GPU model
