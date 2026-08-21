@@ -44,7 +44,7 @@ All results are saved locally to `benchmark_result.json`. Nothing is uploaded au
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+ (Note Portable version ONLY works on Version 3.11 and 3.12)
 - [LM Studio](https://lmstudio.ai) **or** [Ollama](https://ollama.com) running locally with at least one vision-capable model loaded
 - A loaded model (recommended: `qwen2.5-vl-7b-instruct` or `qwen2.5:7b`)
 
