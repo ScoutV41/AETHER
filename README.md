@@ -81,7 +81,7 @@ ollama pull qwen2.5:7b
 
 **4. Run the benchmark**
 ```bash
-python benchmark.py
+python AETHER-V2.py
 ```
 
 ---
