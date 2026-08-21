@@ -812,7 +812,7 @@ def main_menu():
 
                 print("\n  ─────────────────────────────────────────────────────")
                 print("  Share your results to contribute to the database!")
-                print("  Discord: [https://discord.gg/uZ2M8D9cWY]")
+                print("  Discord: [https://discord.gg/YHC6DsGY]")
                 print("  ─────────────────────────────────────────────────────\n")
             else:
                 print(f"\n  {C_RED}[!] Benchmark failed: {results['error']}{C_RESET}")
