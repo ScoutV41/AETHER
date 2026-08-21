@@ -51,6 +51,10 @@ All results are saved locally to `benchmark_result.json`. Nothing is uploaded au
 ```bash
 pip install psutil GPUtil requests
 ```
+For portable version run:
+```bash
+pip install psutil GPUtil numpy torch torch-directml
+``` 
 
 > **Note:** `GPUtil` is for NVIDIA detection. If you're on AMD or CPU-only, it's optional - AETHER will warn you if it's missing but continue fine.
 
