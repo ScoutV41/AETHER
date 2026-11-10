@@ -3,17 +3,6 @@
   AETHER - AI & Hardware Benchmark Runner
   Open Source Local AI Compute Benchmark
 ========================================================
-
-What this script collects and why:
-  - CPU model, core count, RAM         -> context for performance scaling
-  - GPU model, VRAM, driver version     -> primary performance variable
-  - ROCm / CUDA version (if present)   -> affects inference speed significantly
-  - Tokens/sec on a standardized prompt -> the actual benchmark metric
-  - Quantization level of model tested  -> apples-to-apples comparisons
-
-Nothing is uploaded automatically. Results are saved locally to
-benchmark_result.json. Share them however you'd like.
-
 Usage:
   python AETHER-V2.py                          Interactive CUI menu
   python AETHER-V2.py --headless               Run once, no menu, using defaults/auto-detect
