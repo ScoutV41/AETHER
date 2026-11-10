@@ -93,20 +93,6 @@ python AETHER-V2.py
 
 ---
 
-## Sharing your results
-
-Results are saved to `benchmark_result.json` in the same folder you ran the script from.
-
-Share them in the [Discord server](https://discord.gg/YHC6DsGY) in the `#benchmark-results` channel. So I can crowdsource results for comparison charts.
-
-Paste the full JSON or attach the file. Include:
-- Your GPU model
-- Your OS
-- The model + quantization you tested
-- Anything unusual about your setup (undervolted, custom drivers, etc.)
-
----
-
 ## What we're building toward
 
 The goal is a community-maintained database of real-world local inference performance, searchable by GPU, model, quantization, and OS. Think [UserBenchmark](https://www.userbenchmark.com) but for local AI + Performance metrics - and actually trustworthy.
