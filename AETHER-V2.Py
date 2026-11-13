@@ -101,10 +101,11 @@ TEST_DIFFICULTIES = {
 
 DEFAULT_DIFFICULTY    = "easy"
 INFERENCE_TIMEOUT_SEC = 120
+LOAD_TIMEOUT_SEC      = 300  # Extended timeout for first load (cold start)
 NUM_RUNS              = 3
 WARMUP_RUN            = True
 OUTPUT_FILE           = "benchmark_result.json"
-AETHER_VERSION        = "0.4.0"
+AETHER_VERSION        = "0.4.1"
 
 # ANSI Colors
 C_CYAN    = "\033[96m"
@@ -315,7 +316,8 @@ def _detect_amd_windows() -> dict:
                     "gpu_driver":  driver,
                 })
 
-            os.remove(dxdiag_xml)
+            if os.path.exists(dxdiag_xml):
+                os.remove(dxdiag_xml)
             if candidates:
                 best = max(candidates, key=lambda x: x["gpu_vram_gb"])
                 result.update(best)
@@ -490,7 +492,7 @@ def get_model_info(backend: str, base_url: str, model_name: str, interactive: bo
 # BENCHMARK RUNNER
 # ==============================================================================
 
-def run_ollama_benchmark(base_url: str, model_name: str, difficulty_key: str, ctx_override: int | None) -> dict:
+def run_ollama_benchmark(base_url: str, model_name: str, difficulty_key: str, ctx_override: int | None, timeout: int) -> dict:
     cfg = TEST_DIFFICULTIES[difficulty_key]
     ctx_size = ctx_override if ctx_override else cfg["context"]
 
@@ -502,7 +504,7 @@ def run_ollama_benchmark(base_url: str, model_name: str, difficulty_key: str, ct
     }
     start = time.time()
     try:
-        r = requests.post(f"{base_url}/api/generate", json=payload, timeout=INFERENCE_TIMEOUT_SEC)
+        r = requests.post(f"{base_url}/api/generate", json=payload, timeout=timeout)
         elapsed = time.time() - start
 
         if r.status_code != 200:
@@ -526,24 +528,27 @@ def run_ollama_benchmark(base_url: str, model_name: str, difficulty_key: str, ct
     except requests.exceptions.Timeout:
         return {"status": "Failed", "error": "Request timed out (model may be too slow or stuck loading)"}
     except requests.exceptions.ConnectionError:
-        return {"status": "Failed", "error": "Could not connect to Ollama"}
+        return {"status": "Crashed", "error": "Could not connect to Ollama - Server likely crashed"}
     except Exception as e:
         return {"status": "Failed", "error": str(e)}
 
 
-def run_lmstudio_benchmark(base_url: str, model_name: str, difficulty_key: str, ctx_override: int | None) -> dict:
+def run_lmstudio_benchmark(base_url: str, model_name: str, difficulty_key: str, ctx_override: int | None, timeout: int) -> dict:
     cfg = TEST_DIFFICULTIES[difficulty_key]
     ctx_size = ctx_override if ctx_override else cfg["context"]
 
+    # Attempt to pass context settings. Note: LM Studio's API support for this varies by version.
     payload = {
         "model":      model_name,
         "messages":   [{"role": "user", "content": cfg["prompt"]}],
         "max_tokens": cfg["max_tokens"],
         "stream":     False,
+        "num_ctx":    ctx_size,         # Ollama-style override
+        "context_length": ctx_size      # Some OpenAI wrappers use this
     }
     start = time.time()
     try:
-        r = requests.post(f"{base_url}/v1/chat/completions", json=payload, timeout=INFERENCE_TIMEOUT_SEC)
+        r = requests.post(f"{base_url}/v1/chat/completions", json=payload, timeout=timeout)
         elapsed = time.time() - start
 
         if r.status_code != 200:
@@ -569,7 +574,7 @@ def run_lmstudio_benchmark(base_url: str, model_name: str, difficulty_key: str, 
     except requests.exceptions.Timeout:
         return {"status": "Failed", "error": "Request timed out (model may be too slow or stuck loading)"}
     except requests.exceptions.ConnectionError:
-        return {"status": "Failed", "error": "Could not connect to LM Studio"}
+        return {"status": "Crashed", "error": "Could not connect to LM Studio - Server likely crashed"}
     except Exception as e:
         return {"status": "Failed", "error": str(e)}
 
@@ -582,23 +587,35 @@ def run_benchmark(backend: str, base_url: str, model_name: str, difficulty_key: 
     total_runs = NUM_RUNS + (1 if WARMUP_RUN else 0)
 
     for i in range(total_runs):
-        label = "Warm-up" if (WARMUP_RUN and i == 0) else f"Run {i if not WARMUP_RUN else i}/{NUM_RUNS}"
+        is_warmup = (WARMUP_RUN and i == 0)
+        label = "Warm-up" if is_warmup else f"Run {i if not WARMUP_RUN else i}/{NUM_RUNS}"
         print(f"    {C_CYAN}[{label}]{C_RESET} Running inference...")
         
-        if backend == "ollama":
-            result = run_ollama_benchmark(base_url, model_name, difficulty_key, ctx_override)
-        else:
-            result = run_lmstudio_benchmark(base_url, model_name, difficulty_key, ctx_override)
+        # Use extended timeout for the first request to allow model loading from disk (Cold Start)
+        current_timeout = LOAD_TIMEOUT_SEC if is_warmup else INFERENCE_TIMEOUT_SEC
 
-        if WARMUP_RUN and i == 0:
+        if backend == "ollama":
+            result = run_ollama_benchmark(base_url, model_name, difficulty_key, ctx_override, current_timeout)
+        else:
+            result = run_lmstudio_benchmark(base_url, model_name, difficulty_key, ctx_override, current_timeout)
+
+        if result["status"] == "Crashed":
+            print(f"    {C_RED}[!] FATAL ERROR: {result.get('error')}{C_RESET}")
+            return {"status": "Failed", "error": f"Backend crashed during {label}"}
+
+        if is_warmup:
+            if result["status"] != "Success":
+                print(f"    {C_RED}[!] Warm-up failed: {result.get('error')}{C_RESET}")
+                return {"status": "Failed", "error": f"Warm-up run failed: {result.get('error')}"}
             continue
+
         if result["status"] == "Success":
             all_runs.append(result)
         else:
             print(f"    {C_RED}[!] Run failed: {result.get('error')}{C_RESET}")
 
     if not all_runs:
-        return {"status": "Failed", "error": "All runs failed"}
+        return {"status": "Failed", "error": "All timed runs failed"}
 
     gen_speeds = [r["generation_tokens_per_sec"] for r in all_runs]
     wall_times = [r["wall_time_sec"] for r in all_runs]
@@ -787,6 +804,11 @@ def main_menu():
             if not chosen_model:
                 input(f"\n{C_RED}[!] No model selected. Press Enter...{C_RESET}")
                 continue
+
+            # Warning for high context requirements on LM Studio / Ollama
+            if current_difficulty in ["hard", "crazy"]:
+                print(f"\n{C_YELLOW}[!] Note: {diff_info['name']} requires a large context window ({diff_info['context']} tokens).")
+                print(f"    Ensure your backend is configured to allocate enough VRAM for this size.{C_RESET}")
 
             if hw is None:
                 hw = get_system_specs(cpu_only_override=cpu_only_mode)
