@@ -8,6 +8,7 @@ Usage:
   python AETHER-V2.py --headless               Run once, no menu, using defaults/auto-detect
   python AETHER-V2.py --model llama3:8b        Headless, specific model
   python AETHER-V2.py --backend ollama --model llama3:8b --runs 5 --quiet
+  python AETHER-V2.py --difficulty crazy       Headless with specific test difficulty
 """
 
 import time
@@ -44,16 +45,66 @@ except ImportError:
 # == Constants & Colors =========================================================
 OLLAMA_BASE     = "http://localhost:11434"
 LMS_BASE        = "http://localhost:1234"
-BENCHMARK_PROMPT = (
-    "Write a detailed 300-word essay explaining quantum computing to a five-year-old. "
-    "Use simple analogies and avoid technical jargon."
-)
-CONTEXT_WINDOW        = 2048
-INFERENCE_TIMEOUT_SEC = 100
+
+# Test Difficulties Definition
+TEST_DIFFICULTIES = {
+    "easy": {
+        "name": "Easy (Short Essay)",
+        "context": 2048,
+        "max_tokens": 400,
+        "prompt": (
+            "Write a detailed 300-word essay explaining quantum computing to a five-year-old. "
+            "Use simple analogies and avoid technical jargon."
+        )
+    },
+    "medium": {
+        "name": "Medium (Complex & Moderate)",
+        "context": 4096,
+        "max_tokens": 800,
+        "prompt": (
+            "Write a comprehensive architectural analysis comparing microservices and monolithic design patterns. "
+            "Discuss scalability, deployment complexity, latency, fault isolation, and state management trade-offs. "
+            "Provide concrete examples of when to choose each pattern in modern cloud-native enterprise environments."
+        )
+    },
+    "hard": {
+        "name": "Hard (Complex & Long)",
+        "context": 8192,
+        "max_tokens": 1500,
+        "prompt": (
+            "Provide an exhaustive technical breakdown of modern Large Language Model training paradigms, "
+            "focusing specifically on the transition from standard autoregressive causal decoding to Reinforcement Learning from "
+            "Human Feedback (RLHF) and Direct Preference Optimization (DPO). Detail the mathematical underpinnings of the reward model, "
+            "PPO clipping mechanisms, KL-divergence penalties, and memory bottlenecks associated with gradient accumulation across "
+            "distributed GPU clusters (FSDP and Tensor Parallelism)."
+        )
+    },
+    "crazy": {
+        "name": "Crazy (Massive 4k+ Token Prompt)",
+        "context": 16384,
+        "max_tokens": 2500,
+        "prompt": (
+            "You are an elite principal systems architect and distributed computing expert. Below is an exhaustive multi-system "
+            "specification brief detailing a hypothetical global-scale financial ledger system.\n\n" +
+            (
+                "System Component Specification Alpha: The ingestion pipeline handles 500,000 requests per second via Apache Kafka clusters "
+                "replicated across three cloud regions with strict eventual consistency guarantees. Paxos and Raft consensus algorithms are "
+                "utilized for state machine replication across partitioned nodes. Network jitter, Byzantine fault tolerance, partition tolerance, "
+                "and cap-theorem limitations must be fully accounted for under extreme network stress scenarios. "
+            ) * 15 +  # Padding to push prompt size past 4k+ tokens for high VRAM high-context setups
+            "\n\nTask: Analyze the entire specification above. Enumerate every single architectural vulnerability regarding network partitioning, "
+            "state divergence, deadlock potential, and leader election latency. Propose a mathematically sound remediation strategy for each point "
+            "along with pseudo-code implementation blocks for the consensus validation layer."
+        )
+    }
+}
+
+DEFAULT_DIFFICULTY    = "easy"
+INFERENCE_TIMEOUT_SEC = 120
 NUM_RUNS              = 3
 WARMUP_RUN            = True
 OUTPUT_FILE           = "benchmark_result.json"
-AETHER_VERSION        = "0.3.0"
+AETHER_VERSION        = "0.4.0"
 
 # ANSI Colors
 C_CYAN    = "\033[96m"
@@ -84,12 +135,14 @@ def parse_args():
     p.add_argument("--model", type=str, default=None, help="Model name (skips interactive selection)")
     p.add_argument("--backend", type=str, choices=["ollama", "lmstudio"], default=None,
                     help="Force a specific backend instead of auto-detecting")
-    p.add_argument("--ctx", type=int, default=CONTEXT_WINDOW, help="Context window size")
+    p.add_argument("--difficulty", type=str, choices=list(TEST_DIFFICULTIES.keys()), default=None,
+                    help="Select test difficulty (easy, medium, hard, crazy)")
+    p.add_argument("--ctx", type=int, default=None, help="Override context window size")
     p.add_argument("--no-warmup", action="store_true", help="Skip warm-up run")
     p.add_argument("--cpu-only", action="store_true", help="Force CPU-only hardware profiling (skip GPU detection)")
     p.add_argument("--output", type=str, default=OUTPUT_FILE, help="Output JSON path")
     p.add_argument("--timeout", type=int, default=INFERENCE_TIMEOUT_SEC,
-                    help="Seconds to wait for a benchmark response before timing out (default: 100)")
+                    help="Seconds to wait for a benchmark response before timing out")
     p.add_argument("--quiet", action="store_true",
                     help="Headless mode only: suppress the full JSON dump to stdout")
     return p.parse_args()
@@ -212,10 +265,7 @@ def _detect_nvidia() -> dict | None:
 
 
 def _detect_amd_windows() -> dict:
-    """AMD GPU detection on Windows using dxdiag XML with wmic fallback."""
     result = {"gpu_model": "Unknown", "gpu_vram_gb": 0.0, "gpu_driver": "Unknown"}
-
-    # Unique temp filename avoids collisions if AETHER is ever run twice in parallel
     dxdiag_xml = os.path.join(tempfile.gettempdir(), f"aether_dxdiag_{os.getpid()}.xml")
     try:
         subprocess.run(
@@ -266,12 +316,10 @@ def _detect_amd_windows() -> dict:
                 })
 
             os.remove(dxdiag_xml)
-
             if candidates:
                 best = max(candidates, key=lambda x: x["gpu_vram_gb"])
                 result.update(best)
                 return result
-
     except Exception:
         if os.path.exists(dxdiag_xml):
             try:
@@ -309,7 +357,6 @@ def _detect_amd_windows() -> dict:
 
 def _detect_amd_linux() -> dict:
     result = {"gpu_model": "Unknown", "gpu_vram_gb": 0.0, "gpu_driver": "Unknown"}
-
     try:
         out = subprocess.check_output(
             ["rocm-smi", "--showproductname", "--showmeminfo", "vram", "--json"],
@@ -406,7 +453,6 @@ def list_models(backend: str, base_url: str) -> list[str]:
             r = requests.get(f"{base_url}/api/tags", timeout=5)
             if r.status_code == 200:
                 return [m["name"] for m in r.json().get("models", [])]
-
         elif backend == "lmstudio":
             r = requests.get(f"{base_url}/v1/models", timeout=5)
             if r.status_code == 200:
@@ -419,10 +465,7 @@ def list_models(backend: str, base_url: str) -> list[str]:
 def get_model_info(backend: str, base_url: str, model_name: str, interactive: bool = True) -> dict:
     if backend == "ollama":
         try:
-            r = requests.post(
-                f"{base_url}/api/show",
-                json={"name": model_name}, timeout=5
-            )
+            r = requests.post(f"{base_url}/api/show", json={"name": model_name}, timeout=5)
             if r.status_code == 200:
                 details = r.json().get("details", {})
                 return {
@@ -432,18 +475,12 @@ def get_model_info(backend: str, base_url: str, model_name: str, interactive: bo
                 }
         except Exception:
             pass
-
     elif backend == "lmstudio":
         quant = "Unknown"
         for tag in ["Q4_K_M", "Q4_0", "Q8_0", "Q5_K_M", "Q6_K", "Q2_K", "fp16", "bf16", "IQ4_XS", "IQ3_M"]:
             if tag.lower() in model_name.lower():
                 quant = tag
                 break
-        if quant == "Unknown" and interactive:
-            print(f"\n  {C_YELLOW}[?] Could not detect quantization from model ID: '{model_name}'{C_RESET}")
-            user_quant = input("      Enter quantization level (or press Enter to skip): ").strip()
-            if user_quant:
-                quant = user_quant
         return {"quantization": quant, "format": "GGUF", "family": "Unknown"}
 
     return {"quantization": "Unknown", "format": "Unknown", "family": "Unknown"}
@@ -453,12 +490,15 @@ def get_model_info(backend: str, base_url: str, model_name: str, interactive: bo
 # BENCHMARK RUNNER
 # ==============================================================================
 
-def run_ollama_benchmark(base_url: str, model_name: str) -> dict:
+def run_ollama_benchmark(base_url: str, model_name: str, difficulty_key: str, ctx_override: int | None) -> dict:
+    cfg = TEST_DIFFICULTIES[difficulty_key]
+    ctx_size = ctx_override if ctx_override else cfg["context"]
+
     payload = {
         "model":  model_name,
-        "prompt": BENCHMARK_PROMPT,
+        "prompt": cfg["prompt"],
         "stream": False,
-        "options": {"num_ctx": CONTEXT_WINDOW}
+        "options": {"num_ctx": ctx_size}
     }
     start = time.time()
     try:
@@ -481,7 +521,7 @@ def run_ollama_benchmark(base_url: str, model_name: str) -> dict:
             "generation_tokens": gen_tokens,
             "prompt_tokens_per_sec": round(prompt_tokens / (prompt_ns / 1e9), 2) if prompt_ns > 0 else 0,
             "generation_tokens_per_sec": round(gen_tokens / (gen_ns / 1e9), 2) if gen_ns > 0 else 0,
-            "context_window": CONTEXT_WINDOW,
+            "context_window": ctx_size,
         }
     except requests.exceptions.Timeout:
         return {"status": "Failed", "error": "Request timed out (model may be too slow or stuck loading)"}
@@ -491,11 +531,14 @@ def run_ollama_benchmark(base_url: str, model_name: str) -> dict:
         return {"status": "Failed", "error": str(e)}
 
 
-def run_lmstudio_benchmark(base_url: str, model_name: str) -> dict:
+def run_lmstudio_benchmark(base_url: str, model_name: str, difficulty_key: str, ctx_override: int | None) -> dict:
+    cfg = TEST_DIFFICULTIES[difficulty_key]
+    ctx_size = ctx_override if ctx_override else cfg["context"]
+
     payload = {
         "model":      model_name,
-        "messages":   [{"role": "user", "content": BENCHMARK_PROMPT}],
-        "max_tokens": 400,
+        "messages":   [{"role": "user", "content": cfg["prompt"]}],
+        "max_tokens": cfg["max_tokens"],
         "stream":     False,
     }
     start = time.time()
@@ -520,7 +563,7 @@ def run_lmstudio_benchmark(base_url: str, model_name: str) -> dict:
             "generation_tokens":         gen_tokens,
             "prompt_tokens_per_sec":     "N/A (LM Studio)",
             "generation_tokens_per_sec": gen_tps,
-            "context_window":            CONTEXT_WINDOW,
+            "context_window":            ctx_size,
             "note": "LM Studio wall-time derived t/s -- includes prompt processing overhead"
         }
     except requests.exceptions.Timeout:
@@ -531,11 +574,9 @@ def run_lmstudio_benchmark(base_url: str, model_name: str) -> dict:
         return {"status": "Failed", "error": str(e)}
 
 
-def run_benchmark(backend: str, base_url: str, model_name: str) -> dict:
+def run_benchmark(backend: str, base_url: str, model_name: str, difficulty_key: str, ctx_override: int | None) -> dict:
     if backend not in ("ollama", "lmstudio"):
         return {"status": "Failed", "error": "Unknown backend"}
-
-    runner = run_ollama_benchmark if backend == "ollama" else run_lmstudio_benchmark
 
     all_runs = []
     total_runs = NUM_RUNS + (1 if WARMUP_RUN else 0)
@@ -543,7 +584,12 @@ def run_benchmark(backend: str, base_url: str, model_name: str) -> dict:
     for i in range(total_runs):
         label = "Warm-up" if (WARMUP_RUN and i == 0) else f"Run {i if not WARMUP_RUN else i}/{NUM_RUNS}"
         print(f"    {C_CYAN}[{label}]{C_RESET} Running inference...")
-        result = runner(base_url, model_name)
+        
+        if backend == "ollama":
+            result = run_ollama_benchmark(base_url, model_name, difficulty_key, ctx_override)
+        else:
+            result = run_lmstudio_benchmark(base_url, model_name, difficulty_key, ctx_override)
+
         if WARMUP_RUN and i == 0:
             continue
         if result["status"] == "Success":
@@ -560,7 +606,6 @@ def run_benchmark(backend: str, base_url: str, model_name: str) -> dict:
     return {
         "status":                        "Success",
         "runs_completed":                len(all_runs),
-        # Median is the headline number -- more resistant to one-off thermal/background-load outliers
         "generation_tokens_per_sec":     round(sorted(gen_speeds)[len(gen_speeds) // 2], 2),
         "generation_tokens_per_sec_avg": round(sum(gen_speeds) / len(gen_speeds), 2),
         "generation_tokens_per_sec_min": round(min(gen_speeds), 2),
@@ -569,7 +614,7 @@ def run_benchmark(backend: str, base_url: str, model_name: str) -> dict:
         "wall_time_sec_avg":             round(sum(wall_times) / len(wall_times), 2),
         "prompt_tokens":                 all_runs[0]["prompt_tokens"],
         "generation_tokens":             all_runs[0]["generation_tokens"],
-        "context_window":                CONTEXT_WINDOW,
+        "context_window":                all_runs[0]["context_window"],
         "all_runs":                      all_runs,
     }
 
@@ -606,8 +651,7 @@ def compute_aether_score(hw: dict, results: dict) -> dict:
     }
 
 
-def build_payload(backend, chosen_model, model_info, hw, results, aether_score) -> dict:
-    """Shared by both CUI and headless paths so the saved JSON is always identical in shape."""
+def build_payload(backend, chosen_model, model_info, hw, results, aether_score, difficulty_key) -> dict:
     return {
         "aether_version":   AETHER_VERSION,
         "run_id":           f"{platform.node()}-{int(time.time())}",
@@ -615,6 +659,7 @@ def build_payload(backend, chosen_model, model_info, hw, results, aether_score) 
         "backend":          backend,
         "model":            chosen_model,
         "model_info":       model_info,
+        "test_difficulty":  difficulty_key,
         "hardware":         hw,
         "benchmark":        results,
         "aether_score":     aether_score,
@@ -627,14 +672,12 @@ def build_payload(backend, chosen_model, model_info, hw, results, aether_score) 
 # ==============================================================================
 
 def run_headless(args) -> int:
-    """
-    Runs one full benchmark pass with no menu and no blocking prompts.
-    Returns a process exit code (0 success, 1 failure) so it's script/CI friendly.
-    """
     print(BANNER)
     print(f"{C_CYAN}[Headless Mode]{C_RESET} Running non-interactively\n")
 
-    # --- Backend ---
+    difficulty_key = args.difficulty or DEFAULT_DIFFICULTY
+    print(f"{C_GREEN}[+] Test Difficulty: {TEST_DIFFICULTIES[difficulty_key]['name']}{C_RESET}")
+
     if args.backend:
         backend = args.backend
         base_url = OLLAMA_BASE if backend == "ollama" else LMS_BASE
@@ -642,81 +685,52 @@ def run_headless(args) -> int:
         try:
             r = requests.get(check_url, timeout=3)
             if r.status_code != 200:
-                print(f"{C_RED}[!] {backend} did not respond at {base_url} (HTTP {r.status_code}){C_RESET}")
                 return 1
         except Exception:
-            print(f"{C_RED}[!] Could not reach {backend} at {base_url}. Is it running?{C_RESET}")
             return 1
     else:
         backend, base_url = detect_backend()
         if not backend:
-            print(f"{C_RED}[!] No backend detected. Start Ollama or LM Studio, or pass --backend explicitly.{C_RESET}")
             return 1
 
     print(f"{C_GREEN}[+] Backend: {backend.upper()} at {base_url}{C_RESET}")
 
-    # --- Model ---
     models = list_models(backend, base_url)
     if not models:
-        print(f"{C_RED}[!] No models found on {backend}. Load a model first.{C_RESET}")
         return 1
 
     if args.model:
         if args.model not in models:
-            print(f"{C_RED}[!] Model '{args.model}' not found on {backend}.{C_RESET}")
-            print(f"    Available: {', '.join(models)}")
             return 1
         chosen_model = args.model
     elif len(models) == 1:
         chosen_model = models[0]
-        print(f"{C_CYAN}[i] Auto-selected only available model: {chosen_model}{C_RESET}")
     else:
-        print(f"{C_RED}[!] Multiple models available -- pass --model to pick one in headless mode:{C_RESET}")
-        for m in models:
-            print(f"    - {m}")
         return 1
 
     print(f"{C_GREEN}[+] Model: {chosen_model}{C_RESET}")
 
-    # --- Hardware ---
     print(f"{C_CYAN}[+] Profiling hardware...{C_RESET}")
     hw = get_system_specs(cpu_only_override=args.cpu_only)
-    gpu_str = f"{hw['gpu_model']} ({hw['gpu_vram_gb']}GB)" if hw['gpu_model'] != "Unknown/CPU-Only" else "None / CPU-only"
-    print(f"    CPU: {hw['cpu_model']}")
-    print(f"    GPU: {gpu_str}")
 
-    # --- Benchmark ---
-    print(f"\n{C_CYAN}[+] Running benchmark -- {NUM_RUNS} run(s), warmup={'on' if WARMUP_RUN else 'off'}, "
-          f"ctx={CONTEXT_WINDOW}, timeout={INFERENCE_TIMEOUT_SEC}s{C_RESET}\n")
-
-    results = run_benchmark(backend, base_url, chosen_model)
+    print(f"\n{C_CYAN}[+] Running benchmark ({difficulty_key.upper()}) -- {NUM_RUNS} run(s)...{C_RESET}\n")
+    results = run_benchmark(backend, base_url, chosen_model, difficulty_key, args.ctx)
 
     if results["status"] != "Success":
-        print(f"\n{C_RED}[!] Benchmark failed: {results['error']}{C_RESET}")
         return 1
 
-    # interactive=False so a missing LM Studio quant tag never blocks on input() in headless mode
     model_info = get_model_info(backend, base_url, chosen_model, interactive=False)
     aether_score = compute_aether_score(hw, results)
 
     print(f"\n  {C_BOLD}Generation speed (median):{C_RESET} {results['generation_tokens_per_sec']} tok/s")
-    print(f"  {C_BOLD}Avg / Min / Max:{C_RESET}           "
-          f"{results['generation_tokens_per_sec_avg']} / "
-          f"{results['generation_tokens_per_sec_min']} / "
-          f"{results['generation_tokens_per_sec_max']} tok/s")
-    print(f"  {C_BOLD}Wall time (avg):{C_RESET}           {results['wall_time_sec_avg']}s")
-    print(f"\n  {C_GREEN}{C_BOLD}AETHER Score: {aether_score['score']} ({aether_score['tier']}){C_RESET}")
+    print(f"  {C_GREEN}{C_BOLD}AETHER Score: {aether_score['score']} ({aether_score['tier']}){C_RESET}")
 
-    payload = build_payload(backend, chosen_model, model_info, hw, results, aether_score)
+    payload = build_payload(backend, chosen_model, model_info, hw, results, aether_score, difficulty_key)
 
     with open(args.output, "w") as f:
         json.dump(payload, f, indent=4)
 
     print(f"\n{C_CYAN}[+] Results saved to {args.output}{C_RESET}")
-
-    if not args.quiet:
-        print(json.dumps(payload, indent=4))
-
     return 0
 
 
@@ -729,6 +743,7 @@ def main_menu():
     backend, base_url = detect_backend()
     chosen_model = None
     cpu_only_mode = False
+    current_difficulty = DEFAULT_DIFFICULTY
 
     while True:
         clear_screen()
@@ -737,7 +752,7 @@ def main_menu():
         print(f"{C_YELLOW}--- Current Configuration ---{C_RESET}")
 
         if hw is None:
-            print(f"  {C_BOLD}Hardware:{C_RESET} [Not scanned yet - Select option 3 or run benchmark]")
+            print(f"  {C_BOLD}Hardware:{C_RESET} [Not scanned yet]")
         else:
             if cpu_only_mode:
                 print(f"  {C_BOLD}Hardware:{C_RESET} {hw['cpu_model']} {C_RED}[CPU ONLY MODE]{C_RESET}")
@@ -746,95 +761,95 @@ def main_menu():
                 print(f"  {C_BOLD}Hardware:{C_RESET} {hw['cpu_model']} | GPU: {gpu_str}")
 
         b_str = backend.upper() if backend else f"{C_RED}Not Detected{C_RESET}"
-        print(f"  {C_BOLD}Backend:{C_RESET}  {b_str} {f'({base_url})' if base_url else ''}")
+        print(f"  {C_BOLD}Backend:{C_RESET}  {b_str}")
 
         m_str = chosen_model if chosen_model else f"{C_RED}None Selected{C_RESET}"
         print(f"  {C_BOLD}Model:{C_RESET}    {m_str}")
+        
+        diff_info = TEST_DIFFICULTIES[current_difficulty]
+        print(f"  {C_BOLD}Difficulty:{C_RESET}{C_MAGENTA} {diff_info['name']} (Ctx: {diff_info['context']}){C_RESET}")
         print(f"{C_YELLOW}-----------------------------{C_RESET}\n")
 
         print(f"{C_CYAN}1.{C_RESET} Run Benchmark")
-        print(f"{C_CYAN}2.{C_RESET} Toggle CPU-Only Mode")
-        print(f"{C_CYAN}3.{C_RESET} Scan / Re-Scan Hardware (May take a moment)")
-        print(f"{C_CYAN}4.{C_RESET} Detect / Change Backend")
-        print(f"{C_CYAN}5.{C_RESET} Select Model")
+        print(f"{C_CYAN}2.{C_RESET} Change Test Difficulty (Easy / Medium / Hard / Crazy)")
+        print(f"{C_CYAN}3.{C_RESET} Toggle CPU-Only Mode")
+        print(f"{C_CYAN}4.{C_RESET} Scan / Re-Scan Hardware")
+        print(f"{C_CYAN}5.{C_RESET} Detect / Change Backend")
+        print(f"{C_CYAN}6.{C_RESET} Select Model")
         print(f"{C_CYAN}0.{C_RESET} Exit\n")
 
-        choice = input(f"Select an option {C_CYAN}[0-5]{C_RESET}: ").strip()
+        choice = input(f"Select an option {C_CYAN}[0-6]{C_RESET}: ").strip()
 
         if choice == '1':
             if not backend or not base_url:
-                input(f"\n{C_RED}[!] No backend detected. Press Enter to return to menu...{C_RESET}")
+                input(f"\n{C_RED}[!] No backend detected. Press Enter...{C_RESET}")
                 continue
             if not chosen_model:
-                input(f"\n{C_RED}[!] No model selected. Press Enter to return to menu...{C_RESET}")
+                input(f"\n{C_RED}[!] No model selected. Press Enter...{C_RESET}")
                 continue
 
             if hw is None:
-                print(f"\n{C_CYAN}[i] Gathering system specs for the benchmark payload...{C_RESET}")
                 hw = get_system_specs(cpu_only_override=cpu_only_mode)
 
-            print(f"\n{C_GREEN}[+] Starting Benchmark on {chosen_model}...{C_RESET}")
-            print(f"    Context window: {CONTEXT_WINDOW} tokens")
-            print("    This may take a few minutes...\n")
+            print(f"\n{C_GREEN}[+] Starting Benchmark ({diff_info['name']}) on {chosen_model}...{C_RESET}\n")
 
-            results = run_benchmark(backend, base_url, chosen_model)
+            results = run_benchmark(backend, base_url, chosen_model, current_difficulty, None)
 
             if results["status"] == "Success":
                 print(f"\n  {C_BOLD}Generation speed (median):{C_RESET} {results['generation_tokens_per_sec']} tok/s")
-                print(f"  {C_BOLD}Avg / Min / Max:{C_RESET}           "
-                      f"{results['generation_tokens_per_sec_avg']} / "
-                      f"{results['generation_tokens_per_sec_min']} / "
-                      f"{results['generation_tokens_per_sec_max']} tok/s")
                 print(f"  {C_BOLD}Prompt eval speed:{C_RESET}         {results['prompt_tokens_per_sec']} tok/s")
                 print(f"  {C_BOLD}Wall time (avg):{C_RESET}           {results['wall_time_sec_avg']}s")
-                print(f"  {C_BOLD}Tokens generated:{C_RESET}          {results['generation_tokens']}")
 
                 model_info = get_model_info(backend, base_url, chosen_model)
                 aether_score = compute_aether_score(hw, results)
 
                 print(f"\n  {C_GREEN}{C_BOLD}AETHER Score: {aether_score['score']} ({aether_score['tier']}){C_RESET}")
 
-                payload = build_payload(backend, chosen_model, model_info, hw, results, aether_score)
+                payload = build_payload(backend, chosen_model, model_info, hw, results, aether_score, current_difficulty)
                 with open(OUTPUT_FILE, "w") as f:
                     json.dump(payload, f, indent=4)
                 print(f"\n  {C_CYAN}[+] Results saved to {OUTPUT_FILE}{C_RESET}")
-
-                print("\n  ─────────────────────────────────────────────────────")
-                print("  Share your results to contribute to the database!")
-                print("  Discord: [https://discord.gg/YHC6DsGY]")
-                print("  ─────────────────────────────────────────────────────\n")
             else:
                 print(f"\n  {C_RED}[!] Benchmark failed: {results['error']}{C_RESET}")
 
             input("\nPress Enter to return to menu...")
 
         elif choice == '2':
+            clear_screen()
+            print(f"{C_CYAN}--- Select Test Difficulty ---{C_RESET}\n")
+            keys = list(TEST_DIFFICULTIES.keys())
+            for idx, k in enumerate(keys):
+                d = TEST_DIFFICULTIES[k]
+                active_marker = " (Active)" if k == current_difficulty else ""
+                print(f"  {C_YELLOW}[{idx}]{C_RESET} {d['name']}{active_marker}")
+                print(f"      Context: {d['context']} tokens | Max Output: {d['max_tokens']} tokens")
+            
+            try:
+                sel = int(input(f"\nSelect option {C_CYAN}[0-{len(keys)-1}]{C_RESET}: "))
+                if 0 <= sel < len(keys):
+                    current_difficulty = keys[sel]
+            except ValueError:
+                pass
+
+        elif choice == '3':
             cpu_only_mode = not cpu_only_mode
             if hw is not None:
                 hw = get_system_specs(cpu_only_override=cpu_only_mode)
 
-        elif choice == '3':
+        elif choice == '4':
             clear_screen()
-            print(f"{C_CYAN}Scanning hardware profiles...{C_RESET}\n")
             hw = get_system_specs(cpu_only_override=cpu_only_mode)
             input("\nPress Enter to return to menu...")
 
-        elif choice == '4':
+        elif choice == '5':
             backend, base_url = detect_backend()
             chosen_model = None
-            if backend:
-                input(f"\n{C_GREEN}[+] Detected {backend.upper()}{C_RESET}. Press Enter to continue...")
-            else:
-                input(f"\n{C_RED}[!] No backend found.{C_RESET} Press Enter to continue...")
 
-        elif choice == '5':
+        elif choice == '6':
             if not backend or not base_url:
-                input(f"\n{C_RED}[!] Detect a backend first.{C_RESET} Press Enter...")
                 continue
-
             models = list_models(backend, base_url)
             if not models:
-                input(f"\n{C_RED}[!] No models found in backend.{C_RESET} Press Enter...")
                 continue
 
             clear_screen()
@@ -857,15 +872,13 @@ def main_menu():
 def main():
     args = parse_args()
 
-    global NUM_RUNS, CONTEXT_WINDOW, OUTPUT_FILE, WARMUP_RUN, INFERENCE_TIMEOUT_SEC
+    global NUM_RUNS, OUTPUT_FILE, WARMUP_RUN, INFERENCE_TIMEOUT_SEC
     NUM_RUNS = args.runs
-    CONTEXT_WINDOW = args.ctx
     OUTPUT_FILE = args.output
     WARMUP_RUN = not args.no_warmup
     INFERENCE_TIMEOUT_SEC = args.timeout
 
-    # Any of these implies headless intent -- no menu, no input() prompts, exit code reflects success/failure
-    headless_triggered = args.headless or args.model or args.backend
+    headless_triggered = args.headless or args.model or args.backend or args.difficulty
 
     if headless_triggered:
         exit_code = run_headless(args)
